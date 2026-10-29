@@ -66,6 +66,7 @@ CATALOG_FETCH_TIMEOUT_S = 5
 DEFAULT_UPDATE_CHECK_INTERVAL_S = 3600
 SELF_UPDATE_FETCH_TIMEOUT_S = 10
 SELF_UPDATE_STATE_FILE = "self-update.json"
+
 DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
 DEFAULT_CODEX_MODEL_REPORT_REGEX = r"(?m)^model:[ \t]*([^ \t\r\n]+)[ \t]*\r?$"
 ACTIVITY_TAIL_BYTES = 2048
@@ -1092,6 +1093,31 @@ def load_artifact_config(raw: Any, state_dir: Path) -> ArtifactConfig:
 DEFAULT_TICKETED_TASK_TYPES: frozenset[str] = frozenset()
 
 
+FRAGMENTS_SUBDIR = Path("scripts/reporting/inputs/fragments")
+
+
+@dataclass(frozen=True)
+class ReportingConfig:
+    """[reporting] in config.toml. Disabled unless both switches are thrown:
+    enabled=true AND an aios_repo path that exists."""
+
+    enabled: bool = False
+    aios_repo: Path | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.aios_repo is not None and self.aios_repo.is_dir()
+
+
+def load_reporting_config(raw: Any) -> ReportingConfig:
+    if not isinstance(raw, dict):
+        return ReportingConfig()
+    repo_raw = raw.get("aios_repo")
+    repo = Path(str(repo_raw)).expanduser() if repo_raw else None
+    return ReportingConfig(enabled=bool(raw.get("enabled", False)), aios_repo=repo)
+
+
+
 @dataclass(frozen=True)
 class AppConfig:
     path: Path | None
@@ -1110,6 +1136,9 @@ class AppConfig:
     # DEFAULT_TICKETED_TASK_TYPES.
     ticketed_task_types: frozenset[str] = DEFAULT_TICKETED_TASK_TYPES
     engine_bin_diagnostics: tuple[EngineBinDiagnostic, ...] = ()
+    # Post-run reporting fragments to the AIOS workspace (work#1038). Off unless
+    # [reporting] in config.toml enables it and names an existing aios_repo.
+    reporting: ReportingConfig = field(default_factory=ReportingConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1141,6 +1170,7 @@ class AppConfig:
             engine_names=configured_engine_names(raw_engines),
         )
         artifact_config = load_artifact_config(data.get("artifact"), state_dir)
+        reporting_config = load_reporting_config(data.get("reporting"))
         update_config = load_update_config(data.get("update"))
         raw_ticketed = data.get("ticketed_task_types")
         if raw_ticketed is None:
@@ -1172,6 +1202,7 @@ class AppConfig:
             update=update_config,
             ticketed_task_types=ticketed_task_types,
             engine_bin_diagnostics=engine_bin_diagnostics,
+            reporting=reporting_config,
         )
 
 
@@ -9037,6 +9068,21 @@ class RingerRunner:
                 self.dashboard.stop()
             self.logger.close()
             print_summary(self.run_id, self.runtimes)
+            # work#1038: per-run reporting fragment to the AIOS workspace. emit()
+            # never raises — a run's result must not depend on its bookkeeping —
+            # and returns "" when [reporting] is not configured.
+            emit_line = emit_reporting_fragment(
+                config=self.config.reporting,
+                run_id=self.run_id,
+                run_name=self.manifest.run_name,
+                identity=self.identity,
+                started_at=self.started_at,
+                runtimes=self.runtimes,
+                repo=self.manifest.repo,
+                budget_usd=self.manifest.budget_usd,
+            )
+            if emit_line:
+                print(emit_line)
             print("Model log updated; run './ringer.py models' for the per-model scoreboard.")
             # The post-run journey: tell a human exactly where the results live.
             with contextlib.suppress(Exception):
@@ -9954,6 +10000,250 @@ def parse_step_tokens(log_path: Path) -> int:
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         total += int(value)
     return total
+
+
+
+# ---------------------------------------------------------------------------
+# Reporting emitter (work#1038) — one fragment per run, committed to the AIOS
+# workspace. Inlined here because ringer.py is a SINGLE-FILE tool (self-update
+# ships exactly this file); a sibling module would break every context that
+# loads ringer.py on its own, which is how two test suites caught the first
+# version of this change. Decisions encoded (Barry, 2026-09-10, work#1038):
+# commit to mulhacenlabs-aios, one commit per run; emit what the meter knows
+# with per-field provenance (measured/absent) — null, NEVER 0, for a value the
+# provider did not report (a plan-billed engine has no price, work#1028). A
+# failed emission never fails the run: emit() returns a line and raises nothing.
+# Field names follow the nine work#1036 metrics; the fragment is a full input
+# bundle that `mulhacenlabs-aios scripts/reporting/engine.py --dry-run <file>`
+# reads unmodified.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------- the meter
+def parse_step_records(log_path: Path) -> list[dict[str, Any]]:
+    """One record per `step_finish` event in the worker's own log — the same events
+    ringer.parse_step_costs() sums for the budget, kept per step here because the
+    catalog counts steps (`task_steps = count(task_attempts)`).
+
+    Provenance is per field: a number the provider reported is `measured`; a field
+    the event does not carry is null with `absent`. The same NaN/negative guard as
+    parse_step_costs — a worker log is untrusted input.
+    """
+    records: list[dict[str, Any]] = []
+    try:
+        handle = log_path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return records
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "step_finish":
+                continue
+            part = event.get("part") if isinstance(event.get("part"), dict) else {}
+            cost = part.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) \
+                    and math.isfinite(float(cost)) and float(cost) >= 0:
+                cost_val: float | None = float(cost)
+            else:
+                cost_val = None
+            tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+
+            def _count(value: Any) -> int | None:
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+                return None
+
+            rec = {
+                "cost_reported_usd": cost_val,
+                "tokens_in_reported": _count(tokens.get("input")),
+                "tokens_out_reported": _count(tokens.get("output")),
+                "tokens_cache_read_reported": _count(cache.get("read")),
+                # Per-step wall clock is not in the event; the task-level figure
+                # lives on run_tasks[].duration_s instead. null, never 0.
+                "duration_s": None,
+            }
+            rec["provenance"] = {
+                k: ("measured" if rec[k] is not None else "absent")
+                for k in ("cost_reported_usd", "tokens_in_reported",
+                          "tokens_out_reported", "tokens_cache_read_reported",
+                          "duration_s")
+            }
+            records.append(rec)
+    return records
+
+
+# ---------------------------------------------------------------- the fragment
+def _verdict(status: str, final_verdict: str | None) -> str:
+    if status == "pass":
+        return "pass"
+    if (final_verdict or "").upper() == "ERROR":
+        return "indeterminate"
+    return "fail"
+
+
+def build_fragment(*, run_id: str, run_name: str, identity: str,
+                   started_at: datetime, runtimes: list[Any],
+                   repo: Path | None, budget_usd: float | None,
+                   now: datetime | None = None) -> dict[str, Any]:
+    """A full, engine-readable input bundle for ONE run. Pure function of its
+    arguments plus the worker logs the runtimes point at."""
+    now = now or datetime.now(timezone.utc)
+    day = started_at.astimezone(timezone.utc).date().isoformat()
+    project = repo.name if repo is not None else None
+
+    quality, loops, attempts, run_tasks, failed, retries = [], [], [], [], [], []
+    span_start: float | None = None
+    span_end: float | None = None
+    for rt in runtimes:
+        task = rt.task
+        verdict = _verdict(rt.status, rt.final_verdict)
+        subject = task.ticket or task.key
+        quality.append({
+            "subject": subject, "project": project,
+            "loop_type": task.task_type or None, "status": "completed",
+            "verdict": verdict, "independent": True, "evaluator": "executed-check",
+        })
+        elapsed = None
+        if rt.started_at_monotonic is not None and rt.ended_at_monotonic is not None:
+            elapsed = max(0.0, rt.ended_at_monotonic - rt.started_at_monotonic)
+            span_start = rt.started_at_monotonic if span_start is None \
+                else min(span_start, rt.started_at_monotonic)
+            span_end = rt.ended_at_monotonic if span_end is None \
+                else max(span_end, rt.ended_at_monotonic)
+        loops.append({
+            "loop_type": task.task_type or None, "project": project,
+            "status": "completed" if rt.status in {"pass", "fail"} else rt.status,
+            "retries": max(0, (rt.attempts or 1) - 1),
+            "duration_ms": int(elapsed * 1000) if elapsed is not None else None,
+        })
+        steps = parse_step_records(rt.log_path)
+        for step in steps:
+            step.update({"task_key": task.key, "ticket": task.ticket or None,
+                         "engine": task.engine, "model": task.model or None,
+                         "task_type": task.task_type or None})
+        attempts.extend(steps)
+        task_row = {
+            "task_key": task.key, "ticket": task.ticket or None,
+            "engine": task.engine, "model": task.model or None,
+            "task_type": task.task_type or None, "verdict": verdict,
+            # rt.cost_usd is parse_step_costs' sum: provider-reported money only.
+            # None for a plan-billed engine — never 0, and never the estimate
+            # (rt.cost_estimated_usd stays out of this file by design).
+            "task_cost_usd": rt.cost_usd,
+            "duration_s": elapsed,
+            "attempts": rt.attempts or 0,
+            "provenance": {
+                "task_cost_usd": "measured" if rt.cost_usd is not None else "absent",
+                "duration_s": "measured" if elapsed is not None else "absent",
+            },
+        }
+        run_tasks.append(task_row)
+        if verdict != "pass":
+            failed.append(task_row)
+        if (rt.attempts or 0) > 1:
+            # Spend per attempt cannot be split out of one shared log: the cost is
+            # real but unattributable, so the field is null (absent), never a guess.
+            retries.append({
+                "task_key": task.key, "attempt": rt.attempts,
+                "cost_reported_usd": None,
+                "provenance": {"cost_reported_usd": "absent"},
+            })
+
+    duration = (span_end - span_start) if span_start is not None and span_end is not None else None
+    return {
+        "report_id": f"run-{run_id}",
+        "period": {"label": f"{day}..{day}", "start": day, "end": day},
+        "projects": [],
+        "note": (f"Per-run reporting fragment emitted by ringer (work#1038) for run "
+                 f"{run_id} ({run_name}, identity {identity}). Field names follow the "
+                 f"work#1036 metric definitions; every value is provider-reported with "
+                 f"per-field provenance — null means the meter did not report it, "
+                 f"never that it was zero."),
+        "quality_results": quality,
+        "loop_results": loops,
+        "task_attempts": attempts,
+        "run_tasks": run_tasks,
+        "run_tasks_failed": failed,
+        "task_retry_attempts": retries,
+        "run_snapshot": {
+            "duration_s": duration,
+            "budget_usd": budget_usd,
+            "provenance": {
+                "duration_s": "measured" if duration is not None else "absent",
+                "budget_usd": "measured" if budget_usd is not None else "absent",
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------- the transport
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, timeout=60)
+
+
+def write_and_commit(fragment: dict[str, Any], aios_repo: Path, run_id: str) -> str:
+    """Write the fragment and make the one commit per run (Barry, 2026-09-10).
+
+    The file always lands — that is the half that loses data when skipped. The
+    commit happens only when the shared checkout is on `main`: committing while
+    another session holds a branch would smuggle the fragment onto THEIR branch.
+    The whole fragments dir is staged, so a fragment skipped earlier is swept into
+    the next run's commit instead of staying untracked forever. A push failure is
+    reported, not raised — the commit survives locally either way.
+    """
+    day = fragment["period"]["end"]
+    out_dir = aios_repo / FRAGMENTS_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{day}-{run_id}.json"
+    path.write_text(json.dumps(fragment, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+
+    branch = _git(aios_repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch.returncode != 0:
+        return f"reporting fragment written: {path} (NOT committed — not a git checkout)"
+    if branch.stdout.strip() != "main":
+        return (f"reporting fragment written: {path} (NOT committed — checkout is on "
+                f"'{branch.stdout.strip()}', the next run on main sweeps it in)")
+    add = _git(aios_repo, "add", str(FRAGMENTS_SUBDIR))
+    if add.returncode != 0:
+        return f"reporting fragment written: {path} (git add failed: {add.stderr.strip()[:120]})"
+    staged = _git(aios_repo, "diff", "--cached", "--name-only")
+    if not staged.stdout.strip():
+        return f"reporting fragment written: {path} (nothing new to commit)"
+    commit = _git(aios_repo, "commit", "-m",
+                  f"reporting: fragment for run {run_id} — one commit per run (work#1038)",
+                  "--", str(FRAGMENTS_SUBDIR))
+    if commit.returncode != 0:
+        return f"reporting fragment written: {path} (commit failed: {commit.stderr.strip()[:120]})"
+    push = _git(aios_repo, "push", "origin", "main")
+    if push.returncode != 0:
+        return (f"reporting fragment committed: {path} (push failed — it will ride a "
+                f"later push: {push.stderr.strip()[:120]})")
+    return f"reporting fragment committed and pushed: {path}"
+
+
+def emit_reporting_fragment(*, config: ReportingConfig, run_id: str, run_name: str, identity: str,
+         started_at: datetime, runtimes: list[Any], repo: Path | None,
+         budget_usd: float | None) -> str:
+    """The entry point ringer.py calls at run end. NEVER raises — a run's result
+    must not depend on its bookkeeping."""
+    try:
+        if not config.active:
+            return ""  # emission off is the one silent case: nothing was configured
+        fragment = build_fragment(
+            run_id=run_id, run_name=run_name, identity=identity,
+            started_at=started_at, runtimes=runtimes, repo=repo,
+            budget_usd=budget_usd)
+        return write_and_commit(fragment, config.aios_repo, run_id)
+    except Exception as exc:  # noqa: BLE001 — the rule: never fail the run
+        return f"reporting emission FAILED (run unaffected): {exc!r}"
 
 
 def parse_step_costs(log_path: Path) -> tuple[float | None, int]:

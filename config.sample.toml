@@ -218,3 +218,13 @@ index_out = "~/.ringer/artifacts/index.html"
 # no requirement and is never flagged.
 #
 # ticketed_task_types = ["code-fix", "code-feature"]
+
+[reporting]
+# Post-run reporting fragments (work#1038): after every run, write one input
+# bundle for the AIOS reporting engine into <aios_repo>/scripts/reporting/
+# inputs/fragments/ and make ONE commit per run (on main only — a checkout
+# sitting on a branch gets the file, never the commit). Costs and tokens are
+# provider-reported with per-field provenance; a value the meter did not
+# report is null, never 0. A failed emission never fails the run.
+# enabled = true
+# aios_repo = "/path/to/mulhacenlabs-aios"
