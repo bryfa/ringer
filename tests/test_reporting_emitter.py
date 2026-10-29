@@ -179,9 +179,13 @@ class TransportTests(unittest.TestCase):
         repo = Path(td) / "aios"
         repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", branch], check=True)
-        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
-                        "user.name=t", "commit", "--allow-empty", "-q", "-m", "root"],
-                       check=True)
+        # CI runners have no global git identity; the emitter commits as whoever
+        # runs ringer, so the fixture must carry its own identity like a real
+        # operator's checkout does.
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-q",
+                        "-m", "root"], check=True)
         return repo
 
     def _frag(self):
